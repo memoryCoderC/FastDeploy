@@ -247,17 +247,7 @@ class OpenAIServingCompletion:
         """
         Process the full completion request with multiple choices.
         """
-        dealer = None
         try:
-            request_ids = [f"{request_id}_{i}" for i in range(num_choices)]
-            # create dealer
-            dealer, response_queue = await self.engine_client.connection_manager.get_connection(
-                request_id, num_choices
-            )
-
-            for rid in request_ids:
-                dealer.write([b"", rid.encode("utf-8")])
-
             valid_results = [dict()] * num_choices
             output_tokens = [0] * num_choices
             aggregated_top_logprobs = [[[], [], []] for _ in range(num_choices)]
@@ -266,7 +256,6 @@ class OpenAIServingCompletion:
             aggregated_prompt_logprobs_tensors = [None] * num_choices
             completion_batched_token_ids = [[] for _ in range(num_choices)]
             aggregated_speculate_metrics = [None] * num_choices
-            current_waiting_time = 0
             while num_choices > 0:
                 if self.engine_client.check_model_weight_status():
                     return ErrorResponse(
@@ -276,21 +265,8 @@ class OpenAIServingCompletion:
                             type=ErrorType.INVALID_REQUEST_ERROR,
                         )
                     )
-                try:
-                    response = await asyncio.wait_for(response_queue.get(), timeout=10)
-                    current_waiting_time = 0
-                except asyncio.TimeoutError:
-                    current_waiting_time += 10
-                    if current_waiting_time == 300:
-                        status, msg = self.engine_client.check_health()
-                        if not status:
-                            raise ValueError(f"Engine is not healthy: {msg}")
-                        else:
-                            current_waiting_time = 0
-                    await asyncio.sleep(0.1)
-                    continue
-
-                for data in response:
+                response_generator = self.engine_client.generate_task.get_response(request_id)
+                async for data in response_generator:
                     rid = int(data["request_id"].split("_")[-1])
                     if data.get("error_code", 200) != 200:
                         raise ValueError("{}".format(data["error_msg"]))
@@ -367,8 +343,6 @@ class OpenAIServingCompletion:
             tracing.trace_req_finish(request_id)
             trace_print(LoggingEventName.POSTPROCESSING_END, request_id, getattr(request, "user", ""))
             self.engine_client.semaphore.release()
-            if dealer is not None:
-                await self.engine_client.connection_manager.cleanup_request(request_id)
 
     def _echo_back_prompt(self, request, idx):
         """
@@ -418,13 +392,6 @@ class OpenAIServingCompletion:
         Process the stream completion request.
         """
         try:
-            dealer, response_queue = await self.engine_client.connection_manager.get_connection(
-                request_id, num_choices
-            )
-
-            for i in range(num_choices):
-                req_id = f"{request_id}_{i}"
-                dealer.write([b"", req_id.encode("utf-8")])  # 发送多路请求
             output_tokens = [0] * num_choices
             num_cache_tokens = [0] * num_choices
             num_image_tokens = [0] * num_choices
@@ -445,25 +412,11 @@ class OpenAIServingCompletion:
                 model=model_name,
                 choices=choices,
             )
-            current_waiting_time = 0
             while num_choices > 0:
                 if self.engine_client.check_model_weight_status():
                     raise ValueError("Engine is clearing model weight")
-                try:
-                    response = await asyncio.wait_for(response_queue.get(), timeout=10)
-                    current_waiting_time = 0
-                except asyncio.TimeoutError:
-                    current_waiting_time += 10
-                    if current_waiting_time == 300:
-                        status, msg = self.engine_client.check_health()
-                        if not status:
-                            raise ValueError(f"Engine is not healthy: {msg}")
-                        else:
-                            current_waiting_time = 0
-                    await asyncio.sleep(0.1)
-                    continue
-
-                for res in response:
+                response_generator = self.engine_client.generate_task.get_response(request_id)
+                async for res in response_generator:
                     idx = int(res["request_id"].split("_")[-1])
                     if res.get("error_code", 200) != 200:
                         raise ValueError("{}".format(res["error_msg"]))
@@ -642,9 +595,6 @@ class OpenAIServingCompletion:
             tracing.trace_req_finish(request_id)
             trace_print(LoggingEventName.POSTPROCESSING_END, request_id, getattr(request, "user", ""))
             del request
-            if dealer is not None:
-                await self.engine_client.connection_manager.cleanup_request(request_id)
-                self.engine_client.semaphore.release()
             yield "data: [DONE]\n\n"
 
     def request_output_to_completion_response(

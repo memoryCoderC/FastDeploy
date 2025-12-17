@@ -266,21 +266,9 @@ class ZmqOpenAIServing(OpenAIServing):
         """Prepare a generator of responses"""
         request_id = ctx.request_id
         try:
-            num_choices = len(ctx.preprocess_requests)
-            dealer, request_output_queue = await self.engine_client.connection_manager.get_connection(
-                request_id, num_choices
-            )
-            for pr in ctx.preprocess_requests:
-                dealer.write([b"", pr["request_id"].encode("utf-8")])
-            # if self.engine_client.check_model_weight_status():
-            #     raise ValueError("Engine is clearing model weight")
-            while num_choices > 0:
-                request_output_dicts = await asyncio.wait_for(request_output_queue.get(), timeout=60)
-                for request_output_dict in request_output_dicts:
-                    api_server_logger.debug(f"Received RequestOutput: {request_output_dict}")
-                    if request_output_dict["finished"] is True:
-                        num_choices -= 1
-                    yield request_output_dict
+            response_generator = self.engine_client.generate_task.get_response(request_id)
+            async for request_output_dict in response_generator:
+                yield request_output_dict
 
         except Exception as e:
             raise ValueError(f"Error processing response: {str(e)}")

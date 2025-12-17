@@ -16,6 +16,7 @@
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -195,40 +196,57 @@ class BaseComponent:
 
 class Queue(BaseComponent):
     def __init__(self, context, name: str, role: str = "producer"):
-        endpoint = EndpointManager.get_endpoint(name)
-        super().__init__(context, endpoint)
+        # 1. 彻底移除 __init__ 中的复杂逻辑
+        # 不保存 context，不创建 Lock (Lock必须在Loop里创建)
 
+        endpoint = EndpointManager.get_endpoint(name)
+        self.context = context
+        # 显式初始化属性
+        self.endpoint = endpoint
+        self.socket = None
+        self.lock = None  # <--- 修改：Lock 延迟初始化
         self.name = name
         self.role = Role(role)
         self.copy = endpoint.copy
         self.socket_conf = EndpointManager.config.socket_config
         self._msg_id = 0
+        self.full_ep = f"{endpoint.protocol}://{self.endpoint.address}"
 
-        full_ep = f"{endpoint.protocol}://{endpoint.address}"
+        fmq_logger.info(f"Queue {name} instance created (Lazy Init).")
 
-        self.socket = self.context.socket(zmq.PUSH if self.role == Role.PRODUCER else zmq.PULL)
-        self.socket_conf.apply(self.socket, self.role == Role.PRODUCER)
+    async def _ensure_socket(self):
+        """
+        确保资源在当前 Loop 和 Process 中初始化
+        """
+        # 1. 初始化 Lock (确保绑定到当前 Loop)
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+
+        # 2. 初始化 Socket
+        if self.socket is not None:
+            return
+        import zmq.asyncio
+
+        self.context = zmq.asyncio.Context.instance()
+        # 打印详细调试信息
+        pid = os.getpid()
+        fmq_logger.info(f"[{self.role.value}] Init Socket in PID {pid}. ContextID: {id(self.context)}")
 
         if self.role == Role.PRODUCER:
-            self.socket.connect(full_ep)
+            self.socket = self.context.socket(zmq.PUSH)
+            self.socket_conf.apply(self.socket, is_producer=True)
+            self.socket.setsockopt(zmq.IMMEDIATE, 0)
+            self.socket.connect(self.full_ep)
         else:
-            self.socket.bind(full_ep)
+            self.socket = self.context.socket(zmq.PULL)
+            self.socket_conf.apply(self.socket, is_producer=False)
+            self.socket.bind(self.full_ep)
 
-        fmq_logger.info(f"Queue {name} initialized on {full_ep}")
+        fmq_logger.info(f"[{self.role.value}] Ready: {self.full_ep}")
 
     async def put(self, data: Any, shm_threshold: int = 1024 * 1024):
-        """
-        Send data to the queue.
+        await self._ensure_socket()
 
-        Args:
-            data: The data to send. Can be any serializable object or bytes.
-            shm_threshold: Size threshold in bytes. If the data is of type bytes and its size is
-                greater than or equal to this threshold, shared memory will be used to send the message.
-                Default is 1MB (1024 * 1024 bytes).
-
-        Raises:
-            PermissionError: If called by a non-producer role.
-        """
         if self.role != Role.PRODUCER:
             raise PermissionError("Only producers can send messages.")
 
@@ -243,11 +261,14 @@ class Queue(BaseComponent):
         raw = msg.serialize()
 
         async with self.lock:
+            fmq_logger.info(f"[{self.role.value}] Sending message {self._msg_id} to {self.full_ep}")
             await self.socket.send(raw, copy=self.copy)
+            fmq_logger.info(f"[{self.role.value}] Message sent.")
             self._msg_id += 1
 
     async def get(self, timeout: int = None) -> Optional[Message]:
-        # Receive data from queue
+        await self._ensure_socket()
+
         if self.role != Role.CONSUMER:
             raise PermissionError("Only consumers can get messages.")
 
@@ -255,7 +276,9 @@ class Queue(BaseComponent):
             if timeout:
                 raw = await asyncio.wait_for(self.socket.recv(), timeout / 1000)
             else:
+                fmq_logger.info(f"Waiting for message on {self.name}")
                 raw = await self.socket.recv(copy=self.copy)
+                fmq_logger.info(f"Received message on {self.name}")
         except asyncio.TimeoutError:
             fmq_logger.error(f"Timeout receiving message on {self.name}")
             return None
@@ -322,19 +345,14 @@ class FMQ:
     _instance = None
     _context = None
 
-    def __new__(cls, config_path="fmq_config.json"):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            EndpointManager.load_config()
-
-            # Determine IO threads based on global defaults
-            io_threads = 1
-            if EndpointManager.config.endpoints:
-                # Use max io_threads among all endpoints
-                io_threads = max(ep.io_threads for ep in EndpointManager.config.endpoints.values())
-
-            cls._context = zmq.asyncio.Context(io_threads=io_threads)
-        return cls._instance
+    def __init__(self, config_path="fmq_config.json"):
+        EndpointManager.load_config()
+        # Determine IO threads based on global defaults
+        io_threads = 1
+        if EndpointManager.config.endpoints:
+            # Use max io_threads among all endpoints
+            io_threads = max(ep.io_threads for ep in EndpointManager.config.endpoints.values())
+        self._context = zmq.asyncio.Context(io_threads=io_threads)
 
     def queue(self, name: str, role="producer") -> Queue:
         return Queue(self._context, name, role)

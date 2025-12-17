@@ -14,13 +14,16 @@
 # limitations under the License.
 """
 
+import asyncio
 import inspect
 import os
+import threading
 import time
 import traceback
 import uuid
 from copy import copy
 from http import HTTPStatus
+from queue import Queue
 
 import numpy as np
 from filelock import FileLock
@@ -28,6 +31,7 @@ from filelock import FileLock
 import fastdeploy.metrics.trace as tracing
 from fastdeploy import envs
 from fastdeploy.config import FDConfig
+from fastdeploy.engine.request import RequestOutput
 from fastdeploy.entrypoints.openai.utils import DealerConnectionManager
 from fastdeploy.envs import FD_SUPPORT_MAX_CONNECTIONS
 from fastdeploy.eplb.utils import RedundantExpertWorkload
@@ -40,6 +44,7 @@ from fastdeploy.inter_communicator import (
     RearrangeExpertStatus,
     ZmqIpcClient,
 )
+from fastdeploy.inter_communicator.fmq_factory import FMQFactory
 from fastdeploy.metrics.metrics import main_process_metrics
 from fastdeploy.platforms import current_platform
 from fastdeploy.trace.constants import LoggingEventName
@@ -51,6 +56,81 @@ from fastdeploy.utils import (
     api_server_logger,
     to_tensor,
 )
+
+
+class StreamDataQueue:
+    response_queue: Queue[RequestOutput] = Queue()
+    request_count: int = 0
+
+
+class GenerateTask:
+
+    def __init__(self):
+        self.q_e2a_consumer = FMQFactory.q_e2a_consumer()
+        self.queue_map_by_req: dict[str, StreamDataQueue] = {}
+        self.running = True
+        # 1. 创建并启动独立线程
+        self.listener_thread = threading.Thread(target=self._run_listener_loop, name="ZMQListenerThread", daemon=True)
+        self.listener_thread.start()
+
+    def _run_listener_loop(self):
+        """在新线程中启动独立的事件循环"""
+        # 2. 为新线程创建独有的事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            # 3. 运行协程直到 running 为 False
+            loop.run_until_complete(self._listen_response())
+        except Exception as e:
+            api_server_logger.error(f"Listener error: {str(e)}")
+        finally:
+            loop.close()
+
+    async def _listen_response(self):
+        """
+        listen for messages from the dealer connection
+        """
+        while self.running:
+            try:
+                raw_data = await self.q_e2a_consumer.get()
+                if raw_data is None:
+                    continue
+                response_list: list[RequestOutput] = raw_data.payload
+                for response in response_list:
+                    request_id = response.request_id
+                    if request_id[:4] in ["cmpl", "embd"]:
+                        request_id = request_id.rsplit("_", 1)[0]
+                    elif "reward" == request_id[:6]:
+                        request_id = request_id.rsplit("_", 1)[0]
+                    elif "chatcmpl" == request_id[:8]:
+                        request_id = request_id.rsplit("_", 1)[0]
+                    queue_by_request_id = self.queue_map_by_req.get(request_id)
+                    if queue_by_request_id:
+                        queue_by_request_id.response_queue.put(response)
+
+            except Exception as e:
+                api_server_logger.error(f"Listener error: {str(e)}")
+                break
+
+    def add_request(self, request_id):
+        queue_by_request_id = self.queue_map_by_req.get(request_id)
+        if queue_by_request_id is None:
+            self.queue_map_by_req[request_id] = StreamDataQueue()
+        self.queue_map_by_req[request_id].request_count += 1
+
+    async def get_response(self, request_id):
+        queue_by_request_id = self.queue_map_by_req.get(request_id)
+        if queue_by_request_id is None:
+            raise ValueError("There is no request with id: {request_id}.")
+        while queue_by_request_id.request_count > 0:
+            response: RequestOutput = queue_by_request_id.response_queue.get()
+            if response.finished:
+                queue_by_request_id.request_count -= 1
+            if response.error_code != 200:
+                raise ValueError("{}".format(response.error_msg))
+            yield response.to_dict()
+        self.queue_map_by_req.pop(request_id, None)
 
 
 class EngineClient:
@@ -129,6 +209,7 @@ class EngineClient:
             pid, max_connections=int(os.getenv("FD_DEALER_CONNECTIONS", 50))
         )
         self.connection_initialized = False
+        self.generate_task = GenerateTask()
         self.clear_update_lock = FileLock(f"/tmp/fd_weight_clear_update_lock__pid{pid}_port{port}.lock")
 
     def init_eplb_signals(self, ipc_signal_suffix):
@@ -348,6 +429,7 @@ class EngineClient:
             request_id_idx = task.get("request_id")
             parts = request_id_idx.rsplit("_", 1)
             if len(parts) == 1:
+                self.generate_task.add_request(request_id)
                 self._send_task(task)
             else:
                 request_id = parts[0]
@@ -357,6 +439,7 @@ class EngineClient:
                 for i in range(index * n, (index + 1) * n):
                     child_task = copy(task)
                     child_task["request_id"] = f"{request_id}_{i}"
+                    self.generate_task.add_request(request_id)
                     self._send_task(child_task)
             tracing.trace_slice_end(
                 tracing.TraceSpanName.PREPROCESSING, task.get("request_id").split("_")[0], thread_finish_flag=True

@@ -244,45 +244,21 @@ class OpenAIServingChat:
         api_server_logger.info(f"create chat completion request: {request_id}")
 
         try:
-            dealer, response_queue = await self.engine_client.connection_manager.get_connection(
-                request_id, num_choices
-            )
-            request_ids = [f"{request_id}_{i}" for i in range(num_choices)]
-            for rid in request_ids:
-                dealer.write([b"", rid.encode("utf-8")])
             choices = []
-            current_waiting_time = 0
             response_processor = ChatResponseProcessor(
                 data_processor=self.engine_client.data_processor,
                 enable_mm_output=self.enable_mm_output,
                 decoder_base_url=self.tokenizer_base_url,
             )
-            while num_choices > 0:
-                if self.engine_client.check_model_weight_status():
-                    raise ValueError("Engine is clearing model weight")
-                try:
-                    response = await asyncio.wait_for(response_queue.get(), timeout=10)
-                    current_waiting_time = 0
-                except asyncio.TimeoutError:
-                    current_waiting_time += 10
-                    if current_waiting_time == 300:
-                        status, msg = self.engine_client.check_health()
-                        if not status:
-                            if choices:
-                                chunk.choices = choices
-                                yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
-                            raise ValueError(f"Engine is not healthy: {msg}")
-                        else:
-                            current_waiting_time = 0
-                    await asyncio.sleep(0.01)
-                    continue
-
+            response_generator = self.engine_client.generate_task.get_response(request_id)
+            async for response in response_generator:
                 generator = response_processor.process_response_chat(
-                    response,
+                    [response],
                     stream=True,
                     include_stop_str_in_output=include_stop_str_in_output,
                 )
-
+                if self.engine_client.check_model_weight_status():
+                    raise ValueError("Engine is clearing model weight")
                 async for res in generator:
                     idx = int(res["request_id"].split("_")[-1])
                     if res.get("error_code", 200) != 200:
@@ -535,16 +511,8 @@ class OpenAIServingChat:
 
         include_stop_str_in_output = request.include_stop_str_in_output
         try:
-            dealer, response_queue = await self.engine_client.connection_manager.get_connection(
-                request_id, num_choices
-            )
-            # dealer.write([b"", request_id.encode("utf-8")])
-            request_ids = [f"{request_id}_{i}" for i in range(num_choices)]
-            for rid in request_ids:
-                dealer.write([b"", rid.encode("utf-8")])
             previous_num_tokens = [0] * num_choices
             reasoning_num_tokens = [0] * num_choices
-            current_waiting_time = 0
 
             logprob_contents = [[] for _ in range(num_choices)]
             draft_logprob_contents = [[] for _ in range(num_choices)]
@@ -561,31 +529,10 @@ class OpenAIServingChat:
             prompt_logprobs_res_list = [[] for _ in range(num_choices)]
             speculate_metrics = [None for _ in range(num_choices)]
             choices = []
-            while num_choices > 0:
-                if self.engine_client.check_model_weight_status():
-                    return ErrorResponse(
-                        error=ErrorInfo(
-                            message="Model weight cleared",
-                            code=ErrorCode.INVALID_VALUE,
-                            type=ErrorType.INVALID_REQUEST_ERROR,
-                        )
-                    )
-                try:
-                    response = await asyncio.wait_for(response_queue.get(), timeout=10)
-                    current_waiting_time = 0
-                except asyncio.TimeoutError:
-                    current_waiting_time += 10
-                    if current_waiting_time == 300:
-                        status, msg = self.engine_client.check_health()
-                        if not status:
-                            raise ValueError(f"Engine is not healthy: {msg}")
-                        else:
-                            current_waiting_time = 0
-                    await asyncio.sleep(0.1)
-                    continue
-
+            response_generator = self.engine_client.generate_task.get_response(request_id)
+            async for response in response_generator:
                 generator = response_processor.process_response_chat(
-                    response,
+                    [response],
                     stream=False,
                     include_stop_str_in_output=include_stop_str_in_output,
                 )

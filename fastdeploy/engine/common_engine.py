@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import multiprocessing
@@ -50,6 +51,7 @@ from fastdeploy.inter_communicator import (
     ZmqIpcServer,
     ZmqTcpServer,
 )
+from fastdeploy.inter_communicator.fmq_factory import FMQFactory
 from fastdeploy.metrics.metrics import main_process_metrics
 from fastdeploy.model_executor.guided_decoding import schema_checker
 from fastdeploy.plugins.token_processor import load_token_processor_plugins
@@ -155,7 +157,6 @@ class EngineService:
                 self.cfg.parallel_config.engine_worker_queue_port[self.cfg.parallel_config.local_data_parallel_id]
             )
             init_eplb_signals(cfg, current_suffix)
-
         if self.use_async_llm:
             # Add worker management attributes
             self.worker_proc = None
@@ -1058,7 +1059,7 @@ class EngineService:
         self.insert_task_to_scheduler_thread = threading.Thread(target=self._insert_zmq_task_to_scheduler, daemon=True)
         self.insert_task_to_scheduler_thread.start()
 
-        self.receive_output_thread = threading.Thread(target=self._zmq_send_generated_tokens, daemon=True)
+        self.receive_output_thread = threading.Thread(target=self.run_without_loop, daemon=True)
         self.receive_output_thread.start()
 
     def _insert_zmq_task_to_scheduler(self):
@@ -1167,7 +1168,21 @@ class EngineService:
                 del self.data_processor.decode_status[req_id]
         return delta_text, token_ids
 
-    def _zmq_send_generated_tokens(self):
+    def run_without_loop(self):
+
+        # 创建新的事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # 在事件循环中创建任务并运行
+        task = loop.create_task(self._zmq_send_generated_tokens())
+
+        # 运行事件循环直到任务完成
+        loop.run_until_complete(task)
+        loop.close()
+
+    async def _zmq_send_generated_tokens(self):
+        self.q_e2a_producer = FMQFactory.q_e2a_producer()
         """
         Recieve output for zmq
         """
@@ -1208,7 +1223,10 @@ class EngineService:
                         if new_step_contents:
                             new_contents.append(new_step_contents)
                     if new_contents:
-                        self.send_response_server.send_response(None, new_contents)
+                        if envs.FD_ENABLE_INTERNAL_ADAPTER:
+                            self.send_response_server.send_response(None, new_contents)
+                        else:
+                            await self.q_e2a_producer.put(new_contents)
 
                 else:
                     for request_id, contents in results.items():
@@ -1237,7 +1255,10 @@ class EngineService:
                                 new_contents.append(content)
                         if len(new_contents):
                             llm_logger.debug(f"Send response for request id: {request_id}")
-                            self.send_response_server.send_response(request_id, new_contents)
+                            if envs.FD_ENABLE_INTERNAL_ADAPTER:
+                                self.send_response_server.send_response(request_id, new_contents)
+                            else:
+                                await self.q_e2a_producer.put(new_contents)
             except Exception as e:
                 llm_logger.error(f"Unexcepted error happend: {e}, {traceback.format_exc()!s}")
 

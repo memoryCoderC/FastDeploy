@@ -69,11 +69,11 @@ class FMQFactory:
     # ------------------------------
     @classmethod
     def q_e2a_producer(cls):
-        return cls._fmq.queue("q_e2a", role="producer")
+        return FMQ().queue("q_e2a", role="producer")
 
     @classmethod
     def q_e2a_consumer(cls):
-        return cls._fmq.queue("q_e2a", role="consumer")
+        return FMQ().queue("q_e2a", role="consumer")
 
     # ------------------------------
     # Destroy context
